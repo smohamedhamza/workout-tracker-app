@@ -13,6 +13,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+import hashlib
+
 # --- DATABASE FUNCTIONS ---
 DB_FILE = "repquest.db"
 
@@ -20,6 +22,15 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
+    # Table for Users (Auth)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Table for the High-Level Goals (Quests)
     try:
         c.execute("ALTER TABLE quests ADD COLUMN username TEXT")
@@ -30,7 +41,8 @@ def init_db():
         c.execute("ALTER TABLE quests ADD COLUMN deadline TIMESTAMP")
     except sqlite3.OperationalError:
         pass
-
+    
+    # Ensure quests table exists (if not created by previous steps properly)
     c.execute("""
         CREATE TABLE IF NOT EXISTS quests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,6 +68,33 @@ def init_db():
     
     conn.commit()
     conn.close()
+
+# --- AUTH FUNCTIONS ---
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def register_user(username, password):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hash_password(password)))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def login_user(username, password):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    data = c.fetchone()
+    conn.close()
+    
+    if data and data[0] == hash_password(password):
+        return True
+    return False
 
 def get_user_quests(username):
     conn = sqlite3.connect(DB_FILE)
@@ -275,17 +314,35 @@ def format_timedelta(deadline_str):
 def main():
     st.markdown("<h1>REP<span style='color:#38bdf8'>QUEST</span></h1>", unsafe_allow_html=True)
     
-    # --- LOGIN SYSTEM ---
+    # --- AUTH SYSTEM (Tabs) ---
     if 'username' not in st.session_state:
         st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.write("### Identity Required")
-        user_input = st.text_input("Enter Codename / Username")
-        if st.button("Access Dashboard"):
-            if user_input:
-                st.session_state.username = user_input.strip()
-                st.rerun()
-            else:
-                st.error("Identity required.")
+        tab1, tab2 = st.tabs(["Login", "Register"])
+        
+        with tab1:
+            st.write("### Welcome Back")
+            l_user = st.text_input("Username", key="l_user")
+            l_pass = st.text_input("Password", type="password", key="l_pass")
+            if st.button("Enter Dashboard"):
+                if login_user(l_user, l_pass):
+                    st.session_state.username = l_user
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials.")
+        
+        with tab2:
+            st.write("### Join the Quest")
+            r_user = st.text_input("Choose Username", key="r_user")
+            r_pass = st.text_input("Choose Password", type="password", key="r_pass")
+            if st.button("Create Account"):
+                if r_user and r_pass:
+                    if register_user(r_user, r_pass):
+                        st.success("Account created! User 'Login' tab to enter.")
+                    else:
+                        st.error("Username already taken!")
+                else:
+                    st.error("Please fill all fields.")
+                    
         st.markdown('</div>', unsafe_allow_html=True)
         return
 

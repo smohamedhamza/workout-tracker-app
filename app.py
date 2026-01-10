@@ -21,15 +21,20 @@ def init_db():
     c = conn.cursor()
     
     # Table for the High-Level Goals (Quests)
-    # Added 'deadline' column
+    try:
+        c.execute("ALTER TABLE quests ADD COLUMN username TEXT")
+    except sqlite3.OperationalError:
+        pass 
+    
     try:
         c.execute("ALTER TABLE quests ADD COLUMN deadline TIMESTAMP")
     except sqlite3.OperationalError:
-        pass # Column likely already exists
+        pass
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS quests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
             name TEXT NOT NULL,
             target_count INTEGER NOT NULL,
             deadline TIMESTAMP,
@@ -38,8 +43,6 @@ def init_db():
     """)
 
     # Table for individual Workout Logs
-    # Removed 'workout_name' requirement strictly, but we'll keep the column for compatibility or future use, 
-    # letting it be nullable or default string.
     c.execute("""
         CREATE TABLE IF NOT EXISTS workouts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,24 +57,25 @@ def init_db():
     conn.commit()
     conn.close()
 
-def get_all_quests():
+def get_user_quests(username):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    # Filter by username
     c.execute("""
         SELECT q.id, q.name, q.target_count, q.deadline,
                COALESCE(SUM(w.reps), 0) as current_count
         FROM quests q
         LEFT JOIN workouts w ON q.id = w.quest_id
+        WHERE q.username = ?
         GROUP BY q.id
         ORDER BY q.created_at DESC
-    """)
+    """, (username,))
     data = c.fetchall()
     conn.close()
     return data
 
 def get_quest_history(quest_id):
     conn = sqlite3.connect(DB_FILE)
-    # Fetch ID as well to allow deletion
     df = pd.read_sql_query(
         "SELECT id, reps, created_at FROM workouts WHERE quest_id = ? ORDER BY created_at DESC",
         conn,
@@ -80,18 +84,21 @@ def get_quest_history(quest_id):
     conn.close()
     return df
 
-def create_quest(name, target, deadline=None):
+def create_quest(username, name, target, deadline=None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('INSERT INTO quests (name, target_count, deadline) VALUES (?, ?, ?)', (name, target, deadline))
+    c.execute('INSERT INTO quests (username, name, target_count, deadline) VALUES (?, ?, ?, ?)', (username, name, target, deadline))
     conn.commit()
     conn.close()
 
-def add_workout(quest_id, reps):
+def add_workout(quest_id, reps, timestamp=None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # We default name to 'Logged Workout' since user asked to remove naming
-    c.execute("INSERT INTO workouts (quest_id, workout_name, reps) VALUES (?, 'Logged Workout', ?)", (quest_id, reps))
+    
+    if timestamp is None:
+        timestamp = datetime.now()
+        
+    c.execute("INSERT INTO workouts (quest_id, workout_name, reps, created_at) VALUES (?, 'Logged Workout', ?, ?)", (quest_id, reps, timestamp))
     conn.commit()
     conn.close()
 
@@ -268,6 +275,26 @@ def format_timedelta(deadline_str):
 def main():
     st.markdown("<h1>REP<span style='color:#38bdf8'>QUEST</span></h1>", unsafe_allow_html=True)
     
+    # --- LOGIN SYSTEM ---
+    if 'username' not in st.session_state:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.write("### Identity Required")
+        user_input = st.text_input("Enter Codename / Username")
+        if st.button("Access Dashboard"):
+            if user_input:
+                st.session_state.username = user_input.strip()
+                st.rerun()
+            else:
+                st.error("Identity required.")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    # --- LOGGED IN HEADER ---
+    st.caption(f"Logged in as: **{st.session_state.username}**  |  [Logout]", unsafe_allow_html=True)
+    if st.button("Logout", key="logout_btn", type="secondary"):
+        del st.session_state.username
+        st.rerun()
+
     # --- SETUP NEW QUEST (EXPANDER) ---
     with st.expander("➕ Start New Quest", expanded=False):
         with st.form("setup_form", clear_on_submit=True):
@@ -290,10 +317,9 @@ def main():
                 if name and target:
                     final_deadline = None
                     if has_deadline:
-                        # Combine date with custom time
                         final_deadline = datetime.combine(deadline_date, deadline_time).isoformat()
                     
-                    create_quest(name, target, final_deadline)
+                    create_quest(st.session_state.username, name, target, final_deadline)
                     st.success(f"Added Quest: '{name}'!")
                     time.sleep(0.5)
                     st.rerun()
@@ -302,11 +328,11 @@ def main():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # --- DISPLAY QUESTS ---
-    quests = get_all_quests()
+    # --- DISPLAY QUESTS (FILTERED BY USER) ---
+    quests = get_user_quests(st.session_state.username)
     
     if not quests:
-        st.info("No active quests. Open 'Start New Quest' above to begin!")
+        st.info(f"Welcome {st.session_state.username}! You have no active quests. Start one above.")
     
     for quest in quests:
         quest_id, name, target_count, deadline, current_count = quest
@@ -347,11 +373,18 @@ def main():
             """, unsafe_allow_html=True)
             
             if percentage < 100:
-                # SIMPLIFIED LOGGING FORM (No name needed)
-                with st.form(key=f"log_form_{quest_id}", clear_on_submit=True):
+                # LOGGING FORM (WITH BACKDATING)
+                with st.form(key=f"log_form_{quest_id}", clear_on_submit=False):
                     reps = st.number_input("Add Reps", min_value=1, value=10, step=1, key=f"reps_{quest_id}")
+                    
+                    with st.expander("🕒 Backdate / Custom Time"):
+                        bd_date = st.date_input("Date", value=datetime.today(), key=f"bd_d_{quest_id}")
+                        bd_time = st.time_input("Time", value=datetime.now().time(), step=60, key=f"bd_t_{quest_id}")
+                    
                     if st.form_submit_button("Log Workout"):
-                        add_workout(quest_id, reps)
+                        # Construct timestamp
+                        custom_timestamp = datetime.combine(bd_date, bd_time)
+                        add_workout(quest_id, reps, custom_timestamp)
                         st.success("Logged!")
                         time.sleep(0.5)
                         st.rerun()
@@ -360,6 +393,7 @@ def main():
 
         # --- MANAGE / HISTORY ---
         with container.expander("⚙️ Manage & History"):
+
             # HISTORY LOG
             st.markdown("#### 📜 History Log")
             history_df = get_quest_history(quest_id)
